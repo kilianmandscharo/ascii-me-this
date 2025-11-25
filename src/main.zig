@@ -31,8 +31,6 @@ pub fn main() !void {
     const number_of_rows: usize = @intCast(@divTrunc((width + chunk_size - 1), chunk_size));
     const number_of_cols: usize = @intCast(@divTrunc((height + chunk_size - 1), chunk_size));
 
-    std.debug.print("rows: {d}, cols: {d}\n", .{ number_of_rows, number_of_cols });
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -54,8 +52,8 @@ pub fn main() !void {
 
     const scale: f32 = c.stbtt_ScaleForPixelHeight(&font, 12);
 
-    for (0..@intCast(number_of_cols)) |col_chunk| {
-        for (0..@intCast(number_of_rows)) |row_chunk| {
+    for (0..number_of_cols) |col_chunk| {
+        for (0..number_of_rows) |row_chunk| {
             var total: f32 = 0;
             var count: usize = 0;
 
@@ -88,6 +86,7 @@ pub fn main() !void {
             var y0: c_int = @intCast(col_chunk * chunk_size);
             var x1: c_int = @intCast(row_chunk * chunk_size + chunk_size);
             var y1: c_int = @intCast(col_chunk * chunk_size + chunk_size);
+
             c.stbtt_GetCodepointBitmapBox(&font, char, scale, scale, &x0, &y0, &x1, &y1);
 
             const glyph_w: usize = @intCast(x1 - x0);
