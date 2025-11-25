@@ -1,0 +1,4 @@
+*.jpg
+*.jpeg
+zig-out
+.zig-cache

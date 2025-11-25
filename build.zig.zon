@@ -1,0 +1,13 @@
+.{
+    .name = .ascii_me_this,
+    .version = "0.0.0",
+    .fingerprint = 0xc076a9a6c9a60b15, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.0-dev.1184+c41ac8f19",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
