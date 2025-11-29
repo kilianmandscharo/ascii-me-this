@@ -162,10 +162,10 @@ fn createGlyphMap(allocator: std.mem.Allocator) !GlyphMap {
     var map: GlyphMap = .{};
 
     for (characters) |char| {
-        var x0: c_int = @intCast(0);
-        var y0: c_int = @intCast(0);
-        var x1: c_int = @intCast(chunk_size);
-        var y1: c_int = @intCast(chunk_size);
+        var x0: c_int = 0;
+        var y0: c_int = 0;
+        var x1: c_int = chunk_size;
+        var y1: c_int = chunk_size;
 
         c.stbtt_GetCodepointBitmapBox(&font, char, scale, scale, &x0, &y0, &x1, &y1);
 
