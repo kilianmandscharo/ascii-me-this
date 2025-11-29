@@ -9,6 +9,8 @@ const chunk_size = 10;
 const characters = [_]u8{ '.', ':', 'c', 'o', 'P', 'O', '@', '$' };
 
 pub fn main() !void {
+    const n_cores = try std.Thread.getCpuCount();
+
     var width_from_image: c_int = 0;
     var height_from_image: c_int = 0;
     var channels_from_image: c_int = 0;
@@ -28,21 +30,17 @@ pub fn main() !void {
 
     std.debug.print("Loaded image {s}: {d}x{d}, channels={d}\n", .{ filename, width, height, channels });
 
-    const number_of_rows: usize = @intCast(@divTrunc((width + chunk_size - 1), chunk_size));
-    const number_of_cols: usize = @intCast(@divTrunc((height + chunk_size - 1), chunk_size));
+    const number_of_rows: usize = @intCast(@divTrunc((height + chunk_size - 1), chunk_size));
+    const number_of_cols: usize = @intCast(@divTrunc((width + chunk_size - 1), chunk_size));
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
 
-    const allocator = gpa.allocator();
+    const allocator = arena.allocator();
 
-    var out_buffer = try allocator.alloc(u8, width * height);
-    defer allocator.free(out_buffer);
-
+    const out_buffer = try allocator.alloc(u8, width * height);
     for (out_buffer) |*p| p.* = 0;
-
     const font_bytes = try std.fs.cwd().readFileAlloc(allocator, "fonts/Roboto-Regular.ttf", 2 * 1024 * 1024);
-    defer allocator.free(font_bytes);
 
     var font: c.stbtt_fontinfo = undefined;
     if (c.stbtt_InitFont(&font, font_bytes.ptr, 0) == 0) {
@@ -50,17 +48,68 @@ pub fn main() !void {
         return;
     }
 
-    const scale: f32 = c.stbtt_ScaleForPixelHeight(&font, 12);
+    const glyph_map = try createGlyphMap(allocator);
 
-    for (0..number_of_cols) |col_chunk| {
-        for (0..number_of_rows) |row_chunk| {
+    const thread_chunk_size: usize = @intCast(@divTrunc((number_of_rows + n_cores - 1), n_cores));
+    var threads: std.ArrayListUnmanaged(std.Thread) = .{};
+
+    for (0..n_cores) |core| {
+        const row_start = core * thread_chunk_size;
+        const row_end = if (row_start + thread_chunk_size < number_of_rows) row_start + thread_chunk_size else number_of_rows;
+
+        const thread = try std.Thread.spawn(.{}, processChunk, .{
+            out_buffer,
+            pixels,
+            height,
+            width,
+            channels,
+            glyph_map,
+            row_start,
+            row_end,
+            number_of_cols,
+        });
+
+        try threads.append(allocator, thread);
+    }
+
+    for (threads.items) |t| t.join();
+
+    const result = c.stbi_write_jpg(
+        "malenia_out.jpg",
+        width_from_image,
+        height_from_image,
+        1,
+        out_buffer.ptr,
+        90,
+    );
+
+    if (result == 0) {
+        std.debug.print("Failed to write image\n", .{});
+    } else {
+        std.debug.print("Image written successfully\n", .{});
+    }
+}
+
+fn processChunk(
+    out_buffer: []u8,
+    pixels: [*c]u8,
+    height: usize,
+    width: usize,
+    channels: usize,
+    glyph_map: GlyphMap,
+    row_start: usize,
+    row_end: usize,
+    number_of_cols: usize,
+) !void {
+    for (row_start..row_end) |row_chunk| {
+        for (0..number_of_cols) |col_chunk| {
             var total: f32 = 0;
             var count: usize = 0;
 
             for (0..chunk_size) |i| {
                 for (0..chunk_size) |j| {
-                    const y = col_chunk * chunk_size + i;
-                    const x = row_chunk * chunk_size + j;
+                    const y = row_chunk * chunk_size + i;
+                    const x = col_chunk * chunk_size + j;
 
                     if (y >= height or x >= width) {
                         continue;
@@ -80,58 +129,71 @@ pub fn main() !void {
             const gray_scale_value: f32 = total / @as(f32, @floatFromInt(count));
             const char_index: usize = @intFromFloat(gray_scale_value / 256.0 * characters.len);
 
-            const char: c_int = characters[char_index];
+            const char = characters[char_index];
 
-            var x0: c_int = @intCast(row_chunk * chunk_size);
-            var y0: c_int = @intCast(col_chunk * chunk_size);
-            var x1: c_int = @intCast(row_chunk * chunk_size + chunk_size);
-            var y1: c_int = @intCast(col_chunk * chunk_size + chunk_size);
+            const glyph = glyph_map.get(char) orelse unreachable;
 
-            c.stbtt_GetCodepointBitmapBox(&font, char, scale, scale, &x0, &y0, &x1, &y1);
-
-            const glyph_w: usize = @intCast(x1 - x0);
-            const glyph_h: usize = @intCast(y1 - y0);
-
-            const glyph = try allocator.alloc(u8, glyph_w * glyph_h);
-
-            c.stbtt_MakeCodepointBitmap(
-                &font,
-                glyph.ptr,
-                @as(c_int, @intCast(glyph_w)),
-                @as(c_int, @intCast(glyph_h)),
-                @as(c_int, @intCast(glyph_w)),
-                scale,
-                scale,
-                char,
-            );
-
-            for (0..glyph_h) |y| {
-                for (0..glyph_w) |x| {
-                    const src_offset = y * glyph_w + x;
-                    const dst_x = x + row_chunk * chunk_size;
-                    const dst_y = y + col_chunk * chunk_size;
+            for (0..glyph.height) |y| {
+                for (0..glyph.width) |x| {
+                    const src_offset = y * glyph.width + x;
+                    const dst_x = x + col_chunk * chunk_size;
+                    const dst_y = y + row_chunk * chunk_size;
                     if (dst_x < width and dst_y < height) {
-                        out_buffer[dst_y * width + dst_x] = glyph[src_offset];
+                        out_buffer[dst_y * width + dst_x] = glyph.data[src_offset];
                     }
                 }
             }
-
-            allocator.free(glyph);
         }
     }
+}
 
-    const result = c.stbi_write_jpg(
-        "malenia_out.jpg",
-        width_from_image,
-        height_from_image,
-        1,
-        out_buffer.ptr,
-        90,
-    );
+const GlyphMap = std.AutoHashMapUnmanaged(u8, Glyph);
 
-    if (result == 0) {
-        std.debug.print("Failed to write image\n", .{});
-    } else {
-        std.debug.print("Image written successfully\n", .{});
+const Glyph = struct {
+    data: []u8,
+    width: usize,
+    height: usize,
+};
+
+fn createGlyphMap(allocator: std.mem.Allocator) !GlyphMap {
+    const font_bytes = try std.fs.cwd().readFileAlloc(allocator, "fonts/Roboto-Regular.ttf", 2 * 1024 * 1024);
+
+    var font: c.stbtt_fontinfo = undefined;
+    if (c.stbtt_InitFont(&font, font_bytes.ptr, 0) == 0) {
+        std.debug.print("Failed to init font\n", .{});
+        return error.FontInitFailed;
     }
+
+    const scale: f32 = c.stbtt_ScaleForPixelHeight(&font, 12);
+
+    var map: GlyphMap = .{};
+
+    for (characters) |char| {
+        var x0: c_int = @intCast(0);
+        var y0: c_int = @intCast(0);
+        var x1: c_int = @intCast(chunk_size);
+        var y1: c_int = @intCast(chunk_size);
+
+        c.stbtt_GetCodepointBitmapBox(&font, char, scale, scale, &x0, &y0, &x1, &y1);
+
+        const glyph_w: usize = @intCast(x1 - x0);
+        const glyph_h: usize = @intCast(y1 - y0);
+
+        const glyph = try allocator.alloc(u8, glyph_w * glyph_h);
+
+        c.stbtt_MakeCodepointBitmap(
+            &font,
+            glyph.ptr,
+            @as(c_int, @intCast(glyph_w)),
+            @as(c_int, @intCast(glyph_h)),
+            @as(c_int, @intCast(glyph_w)),
+            scale,
+            scale,
+            char,
+        );
+
+        try map.put(allocator, char, Glyph{ .data = glyph, .width = glyph_w, .height = glyph_h });
+    }
+
+    return map;
 }
