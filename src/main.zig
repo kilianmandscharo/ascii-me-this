@@ -68,7 +68,7 @@ pub fn main() !void {
     for (threads.items) |t| t.join();
 
     const result = c.stbi_write_jpg(
-        "malenia_out.jpg",
+        "malenia_out_2.jpg",
         width_from_image,
         height_from_image,
         1,
@@ -96,8 +96,8 @@ fn processChunk(
 ) !void {
     for (row_start..row_end) |row_chunk| {
         for (0..number_of_cols) |col_chunk| {
-            var total: f32 = 0;
-            var count: usize = 0;
+            var total: u32 = 0;
+            var count: u32 = 0;
 
             for (0..chunk_size) |i| {
                 for (0..chunk_size) |j| {
@@ -109,21 +109,18 @@ fn processChunk(
                     }
 
                     const offset = (y * width + x) * channels;
-                    const r: f32 = @floatFromInt(pixels[offset]);
-                    const g: f32 = @floatFromInt(pixels[offset + 1]);
-                    const b: f32 = @floatFromInt(pixels[offset + 2]);
-                    total += r * 0.299;
-                    total += g * 0.587;
-                    total += b * 0.114;
+                    const r = pixels[offset];
+                    const g = pixels[offset + 1];
+                    const b = pixels[offset + 2];
+                    total += (@as(u16, 77) * @as(u16, r) + @as(u16, 150) * @as(u16, g) + @as(u16, 29) * @as(u16, b)) >> 8;
+                    // total += (@as(u16, r) + @as(u16, g) + @as(u16, b)) / 3;
                     count += 1;
                 }
             }
 
-            const gray_scale_value: f32 = total / @as(f32, @floatFromInt(count));
-            const char_index: usize = @intFromFloat(gray_scale_value / 256.0 * characters.len);
-
+            const gray: u8 = @intCast(total / count);
+            const char_index: usize = (gray * characters.len) >> 8;
             const char = characters[char_index];
-
             const glyph = glyph_map.get(char) orelse unreachable;
 
             for (0..glyph.height) |y| {
