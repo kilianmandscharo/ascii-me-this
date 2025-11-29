@@ -40,13 +40,6 @@ pub fn main() !void {
 
     const out_buffer = try allocator.alloc(u8, width * height);
     for (out_buffer) |*p| p.* = 0;
-    const font_bytes = try std.fs.cwd().readFileAlloc(allocator, "fonts/Roboto-Regular.ttf", 2 * 1024 * 1024);
-
-    var font: c.stbtt_fontinfo = undefined;
-    if (c.stbtt_InitFont(&font, font_bytes.ptr, 0) == 0) {
-        std.debug.print("Failed to init font\n", .{});
-        return;
-    }
 
     const glyph_map = try createGlyphMap(allocator);
 
