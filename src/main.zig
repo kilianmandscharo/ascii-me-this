@@ -1,14 +1,13 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("stb_image.h");
-    @cInclude("stb_image_write.h");
-    @cInclude("stb_truetype.h");
-});
+const c = @import("c");
 
 const chunk_size = 10;
 const characters = [_]u8{ '.', ':', 'c', 'o', 'P', 'O', '@', '$' };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+
     const n_cores = try std.Thread.getCpuCount();
 
     var width_from_image: c_int = 0;
@@ -33,18 +32,13 @@ pub fn main() !void {
     const number_of_rows: usize = @intCast(@divTrunc((height + chunk_size - 1), chunk_size));
     const number_of_cols: usize = @intCast(@divTrunc((width + chunk_size - 1), chunk_size));
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    const allocator = arena.allocator();
-
-    const out_buffer = try allocator.alloc(u8, width * height);
+    const out_buffer = try arena.alloc(u8, width * height);
     for (out_buffer) |*p| p.* = 0;
 
-    const glyph_map = try createGlyphMap(allocator);
+    const glyph_map = try createGlyphMap(io, arena);
 
     const thread_chunk_size: usize = @intCast(@divTrunc((number_of_rows + n_cores - 1), n_cores));
-    var threads: std.ArrayListUnmanaged(std.Thread) = .{};
+    var threads: std.ArrayList(std.Thread) = .empty;
 
     for (0..n_cores) |core| {
         const row_start = core * thread_chunk_size;
@@ -62,7 +56,7 @@ pub fn main() !void {
             number_of_cols,
         });
 
-        try threads.append(allocator, thread);
+        try threads.append(arena, thread);
     }
 
     for (threads.items) |t| t.join();
@@ -145,8 +139,8 @@ const Glyph = struct {
     height: usize,
 };
 
-fn createGlyphMap(allocator: std.mem.Allocator) !GlyphMap {
-    const font_bytes = try std.fs.cwd().readFileAlloc(allocator, "fonts/Roboto-Regular.ttf", 2 * 1024 * 1024);
+fn createGlyphMap(io: std.Io, arena: std.mem.Allocator) !GlyphMap {
+    const font_bytes = try std.Io.Dir.cwd().readFileAlloc(io, "fonts/Roboto-Regular.ttf", arena, .limited(2 * 1024 * 1024));
 
     var font: c.stbtt_fontinfo = undefined;
     if (c.stbtt_InitFont(&font, font_bytes.ptr, 0) == 0) {
@@ -169,7 +163,7 @@ fn createGlyphMap(allocator: std.mem.Allocator) !GlyphMap {
         const glyph_w: usize = @intCast(x1 - x0);
         const glyph_h: usize = @intCast(y1 - y0);
 
-        const glyph = try allocator.alloc(u8, glyph_w * glyph_h);
+        const glyph = try arena.alloc(u8, glyph_w * glyph_h);
 
         c.stbtt_MakeCodepointBitmap(
             &font,
@@ -182,7 +176,7 @@ fn createGlyphMap(allocator: std.mem.Allocator) !GlyphMap {
             char,
         );
 
-        try map.put(allocator, char, Glyph{ .data = glyph, .width = glyph_w, .height = glyph_h });
+        try map.put(arena, char, Glyph{ .data = glyph, .width = glyph_w, .height = glyph_h });
     }
 
     return map;

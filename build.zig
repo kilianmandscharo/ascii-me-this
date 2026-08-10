@@ -4,33 +4,44 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("lib/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "ascii_me_this",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{
+                    .name = "c",
+                    .module = translate_c.createModule(),
+                },
+            },
         }),
     });
 
-    exe.root_module.addIncludePath(b.path("libs/stb"));
+    exe.root_module.addIncludePath(b.path("lib/stb"));
 
     exe.root_module.addCSourceFile(.{
-        .file = b.path("libs/stb/stb_image.c"),
+        .file = b.path("lib/stb/stb_image.c"),
         .flags = &.{},
     });
 
     exe.root_module.addCSourceFile(.{
-        .file = b.path("libs/stb/stb_image_write.c"),
+        .file = b.path("lib/stb/stb_image_write.c"),
         .flags = &.{},
     });
 
     exe.root_module.addCSourceFile(.{
-        .file = b.path("libs/stb/stb_truetype.c"),
+        .file = b.path("lib/stb/stb_truetype.c"),
         .flags = &.{},
     });
 
-    exe.linkLibC();
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
