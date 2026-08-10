@@ -8,15 +8,24 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
 
+    const args = try init.minimal.args.toSlice(arena);
+    std.debug.print("{s}\n", .{args[0]});
+
+    if (args.len < 3) {
+        std.debug.print("usage: {s} <input_path> <output_path>\n", .{args[0]});
+        std.process.exit(1);
+    }
+
+    const input_path = args[1];
+    const output_path = args[2];
+
     const n_cores = try std.Thread.getCpuCount();
 
     var width_from_image: c_int = 0;
     var height_from_image: c_int = 0;
     var channels_from_image: c_int = 0;
 
-    const filename = "malenia.jpg";
-
-    const pixels = c.stbi_load(filename, &width_from_image, &height_from_image, &channels_from_image, 0);
+    const pixels = c.stbi_load(input_path, &width_from_image, &height_from_image, &channels_from_image, 0);
     if (pixels == null) {
         std.debug.print("Failed to load image: {s}\n", .{c.stbi_failure_reason()});
         return;
@@ -27,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     const height: usize = @intCast(height_from_image);
     const channels: usize = @intCast(channels_from_image);
 
-    std.debug.print("Loaded image {s}: {d}x{d}, channels={d}\n", .{ filename, width, height, channels });
+    std.debug.print("Loaded image {s}: {d}x{d}, channels={d}\n", .{ input_path, width, height, channels });
 
     const number_of_rows: usize = @intCast(@divTrunc((height + chunk_size - 1), chunk_size));
     const number_of_cols: usize = @intCast(@divTrunc((width + chunk_size - 1), chunk_size));
@@ -62,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
     for (threads.items) |t| t.join();
 
     const result = c.stbi_write_jpg(
-        "malenia_out_2.jpg",
+        output_path,
         width_from_image,
         height_from_image,
         1,
