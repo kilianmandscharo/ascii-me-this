@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const pixels = c.stbi_load(input_path, &width_from_image, &height_from_image, &channels_from_image, 0);
     if (pixels == null) {
         std.debug.print("Failed to load image: {s}\n", .{c.stbi_failure_reason()});
-        return;
+        std.process.exit(1);
     }
     defer c.stbi_image_free(pixels);
 
@@ -51,6 +51,8 @@ pub fn main(init: std.process.Init) !void {
 
     for (0..n_cores) |core| {
         const row_start = core * thread_chunk_size;
+        if (row_start > number_of_rows) continue;
+
         const row_end = if (row_start + thread_chunk_size < number_of_rows) row_start + thread_chunk_size else number_of_rows;
 
         const thread = try std.Thread.spawn(.{}, processChunk, .{
@@ -121,8 +123,8 @@ fn processChunk(
                 }
             }
 
-            const gray: u8 = @intCast(total / count);
-            const char_index: usize = (gray * characters.len) >> 8;
+            const intensity: u8 = @intCast(total / count);
+            const char_index: usize = (@as(u16, intensity) * @as(u16, characters.len)) >> 8;
             const char = characters[char_index];
             const glyph = glyph_map.get(char) orelse unreachable;
 
