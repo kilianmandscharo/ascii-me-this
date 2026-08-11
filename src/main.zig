@@ -4,8 +4,15 @@ const c = @import("c");
 const chunk_size = 10;
 const characters = [_]u8{ '.', ':', 'c', 'o', 'P', 'O', '@', '$' };
 
+const GAUSSIAN = &.{
+    &.{ 1, 4, 7, 4, 1 },
+    &.{ 4, 16, 26, 16, 4 },
+    &.{ 7, 26, 41, 26, 7 },
+    &.{ 4, 16, 26, 16, 4 },
+    &.{ 1, 4, 7, 4, 1 },
+};
+
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
@@ -19,73 +26,68 @@ pub fn main(init: std.process.Init) !void {
     const input_path = args[1];
     const output_path = args[2];
 
-    const n_cores = try std.Thread.getCpuCount();
+    var input_image = try Image.fromPath(input_path);
+    defer input_image.deinit();
 
-    var width_from_image: c_int = 0;
-    var height_from_image: c_int = 0;
-    var channels_from_image: c_int = 0;
+    var output_image = try Image.fromRgb(arena, &input_image);
+    defer output_image.deinit();
 
-    const pixels = c.stbi_load(input_path, &width_from_image, &height_from_image, &channels_from_image, 0);
-    if (pixels == null) {
-        std.debug.print("Failed to load image: {s}\n", .{c.stbi_failure_reason()});
-        std.process.exit(1);
-    }
-    defer c.stbi_image_free(pixels);
+    var blurred_image = try output_image.applyKernel(arena, GAUSSIAN);
+    defer blurred_image.deinit();
 
-    const width: usize = @intCast(width_from_image);
-    const height: usize = @intCast(height_from_image);
-    const channels: usize = @intCast(channels_from_image);
+    try blurred_image.write(output_path);
 
-    std.debug.print("Loaded image {s}: {d}x{d}, channels={d}\n", .{ input_path, width, height, channels });
+    // var img = try Image.fromRgb(arena, pixels, width, height, channels);
 
-    const number_of_rows: usize = @intCast(@divTrunc((height + chunk_size - 1), chunk_size));
-    const number_of_cols: usize = @intCast(@divTrunc((width + chunk_size - 1), chunk_size));
+    // try img.write(output_path);
 
-    const out_buffer = try arena.alloc(u8, width * height);
-    for (out_buffer) |*p| p.* = 0;
+    // const n_cores = try std.Thread.getCpuCount();
 
-    const glyph_map = try createGlyphMap(io, arena);
+    // const number_of_rows: usize = @intCast(@divTrunc((height + chunk_size - 1), chunk_size));
+    // const number_of_cols: usize = @intCast(@divTrunc((width + chunk_size - 1), chunk_size));
 
-    const thread_chunk_size: usize = @intCast(@divTrunc((number_of_rows + n_cores - 1), n_cores));
-    var threads: std.ArrayList(std.Thread) = .empty;
-
-    for (0..n_cores) |core| {
-        const row_start = core * thread_chunk_size;
-        if (row_start > number_of_rows) continue;
-
-        const row_end = if (row_start + thread_chunk_size < number_of_rows) row_start + thread_chunk_size else number_of_rows;
-
-        const thread = try std.Thread.spawn(.{}, processChunk, .{
-            out_buffer,
-            pixels,
-            height,
-            width,
-            channels,
-            glyph_map,
-            row_start,
-            row_end,
-            number_of_cols,
-        });
-
-        try threads.append(arena, thread);
-    }
-
-    for (threads.items) |t| t.join();
-
-    const result = c.stbi_write_jpg(
-        output_path,
-        width_from_image,
-        height_from_image,
-        1,
-        out_buffer.ptr,
-        90,
-    );
-
-    if (result == 0) {
-        std.debug.print("Failed to write image\n", .{});
-    } else {
-        std.debug.print("Image written successfully\n", .{});
-    }
+    // const glyph_map = try createGlyphMap(io, arena);
+    //
+    // const thread_chunk_size: usize = @intCast(@divTrunc((number_of_rows + n_cores - 1), n_cores));
+    // var threads: std.ArrayList(std.Thread) = .empty;
+    //
+    // for (0..n_cores) |core| {
+    //     const row_start = core * thread_chunk_size;
+    //     if (row_start > number_of_rows) continue;
+    //
+    //     const row_end = if (row_start + thread_chunk_size < number_of_rows) row_start + thread_chunk_size else number_of_rows;
+    //
+    //     const thread = try std.Thread.spawn(.{}, processChunk, .{
+    //         img.out_buffer,
+    //         pixels,
+    //         height,
+    //         width,
+    //         channels,
+    //         glyph_map,
+    //         row_start,
+    //         row_end,
+    //         number_of_cols,
+    //     });
+    //
+    //     try threads.append(arena, thread);
+    // }
+    //
+    // for (threads.items) |t| t.join();
+    //
+    // const result = c.stbi_write_jpg(
+    //     output_path,
+    //     width_from_image,
+    //     height_from_image,
+    //     1,
+    //     img.buf.ptr,
+    //     90,
+    // );
+    //
+    // if (result == 0) {
+    //     std.debug.print("Failed to write image\n", .{});
+    // } else {
+    //     std.debug.print("Image written successfully\n", .{});
+    // }
 }
 
 fn processChunk(
@@ -118,7 +120,6 @@ fn processChunk(
                     const g = pixels[offset + 1];
                     const b = pixels[offset + 2];
                     total += (@as(u16, 77) * @as(u16, r) + @as(u16, 150) * @as(u16, g) + @as(u16, 29) * @as(u16, b)) >> 8;
-                    // total += (@as(u16, r) + @as(u16, g) + @as(u16, b)) / 3;
                     count += 1;
                 }
             }
@@ -141,6 +142,150 @@ fn processChunk(
         }
     }
 }
+
+const Image = struct {
+    buf: []u8,
+    width: usize,
+    height: usize,
+    channels: usize,
+    is_stbi_src: bool = false,
+
+    const FACTOR_RED: u16 = 77;
+    const FACTOR_GREEN: u16 = 150;
+    const FACTOR_BLUE: u16 = 29;
+
+    fn deinit(self: *Image) void {
+        if (self.is_stbi_src) {
+            c.stbi_image_free(self.buf.ptr);
+        }
+    }
+
+    fn fromImg(arena: std.mem.Allocator, src: *Image) !Image {
+        const out_buffer = try arena.alloc(u8, src.width * src.height);
+        for (out_buffer) |*p| p.* = 0;
+
+        return .{
+            .buf = out_buffer,
+            .width = src.width,
+            .height = src.height,
+            .channels = src.channels,
+        };
+    }
+
+    fn fromPath(path: [:0]const u8) !Image {
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var channels: c_int = 0;
+
+        const pixels = c.stbi_load(path, &width, &height, &channels, 0);
+
+        if (pixels == null) {
+            std.debug.print("Failed to load image: {s}\n", .{c.stbi_failure_reason()});
+            return error.ReadFailure;
+        }
+
+        return .{
+            .buf = pixels[0..@intCast(width * height * channels)],
+            .width = @intCast(width),
+            .height = @intCast(height),
+            .channels = @intCast(channels),
+            .is_stbi_src = true,
+        };
+    }
+
+    fn fromRgb(arena: std.mem.Allocator, src: *Image) !Image {
+        const out_buffer = try arena.alloc(u8, src.width * src.height);
+        for (out_buffer) |*p| p.* = 0;
+
+        var img: Image = .{
+            .buf = out_buffer,
+            .width = src.width,
+            .height = src.height,
+            .channels = 1,
+        };
+
+        for (0..src.height) |y| {
+            for (0..src.width) |x| {
+                const r = @as(u16, src.getWithOffset(y, x, 0));
+                const g = @as(u16, src.getWithOffset(y, x, 1));
+                const b = @as(u16, src.getWithOffset(y, x, 2));
+                const val: u8 = @intCast((FACTOR_RED * r + FACTOR_GREEN * g + FACTOR_BLUE * b) >> 8);
+                img.set(y, x, val);
+            }
+        }
+
+        return img;
+    }
+
+    fn applyKernel(self: *Image, arena: std.mem.Allocator, kernel: []const []const i8) !Image {
+        var new_img = try Image.fromImg(arena, self);
+        const offset: i64 = @as(i64, @intCast(kernel.len - 1)) >> 1;
+
+        for (0..self.height) |y| {
+            for (0..self.width) |x| {
+                var sum: i64 = 0;
+                var weight_sum: i64 = 0;
+                for (kernel, 0..) |row, k_y| {
+                    for (row, 0..) |factor, k_x| {
+                        const offset_y: i64 = @as(i64, @intCast(k_y)) - offset;
+                        const offset_x: i64 = @as(i64, @intCast(k_x)) - offset;
+                        const img_y: i64 = @as(i64, @intCast(y)) + offset_y;
+                        const img_x: i64 = @as(i64, @intCast(x)) + offset_x;
+
+                        if (img_y < 0 or img_y >= self.height or img_x < 0 or img_x >= self.width) {
+                            continue;
+                        }
+
+                        weight_sum += factor;
+                        sum += @as(i16, @intCast(self.get(@intCast(img_y), @intCast(img_x)))) * @as(i16, @intCast(factor));
+                    }
+                }
+
+                new_img.set(
+                    y,
+                    x,
+                    @intFromFloat(
+                        @as(f32, @floatFromInt(sum)) / @as(f32, @floatFromInt(weight_sum)),
+                    ),
+                );
+            }
+        }
+
+        return new_img;
+    }
+
+    inline fn getIndex(self: *Image, y: usize, x: usize) usize {
+        return (y * self.width + x) * self.channels;
+    }
+
+    inline fn get(self: *Image, y: usize, x: usize) u8 {
+        return self.buf[self.getIndex(y, x)];
+    }
+
+    inline fn getWithOffset(self: *Image, y: usize, x: usize, offset: usize) u8 {
+        return self.buf[self.getIndex(y, x) + offset];
+    }
+
+    inline fn set(self: *Image, y: usize, x: usize, val: u8) void {
+        const index = self.getIndex(y, x);
+        self.buf[index] = val;
+    }
+
+    fn write(self: *Image, path: [*c]const u8) !void {
+        const result = c.stbi_write_jpg(
+            path,
+            @intCast(self.width),
+            @intCast(self.height),
+            @intCast(self.channels),
+            self.buf.ptr,
+            90,
+        );
+
+        if (result == 0) {
+            return error.WriteFailure;
+        }
+    }
+};
 
 const GlyphMap = std.AutoHashMapUnmanaged(u8, Glyph);
 
