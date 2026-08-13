@@ -30,28 +30,33 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     std.debug.print("{s}\n", .{args[0]});
 
-    if (args.len < 3) {
-        std.debug.print("usage: {s} <input_path> <output_path>\n", .{args[0]});
+    if (args.len < 2) {
+        std.debug.print("usage: {s} <input_path>\n", .{args[0]});
         std.process.exit(1);
     }
 
     const input_path = args[1];
-    const output_path = args[2];
 
     var input_image = try Image.fromPath(input_path);
     defer input_image.deinit();
 
-    var output_image = try Image.fromRgb(arena, &input_image);
-    var blurred_image = try output_image.gaussian(arena);
-    var gradient_threshold_image = try blurred_image.gradientMagnitudeThreshold(arena);
-    var result = try gradient_threshold_image.doubleThreshold(arena);
-    var hysteresis_image = try result.image.hysteresis(arena, &result.weak, &result.strong);
+    var image = try Image.fromRgb(arena, &input_image);
+    try image.write("./image_grayscale.jpg");
 
-    try hysteresis_image.write(output_path);
+    image.gaussian();
+    try image.write("./image_blurred.jpg");
 
-    // var img = try Image.fromRgb(arena, pixels, width, height, channels);
+    var directions = try image.sobel(arena);
+    try image.write("./image_sobel.jpg");
 
-    // try img.write(output_path);
+    image.gradientMagnitudeThreshold(&directions);
+    try image.write("./image_gradient_threshold.jpg");
+
+    var doubleThreshold = try image.doubleThreshold(arena);
+    try image.write("./image_double_threshold.jpg");
+
+    try image.hysteresis(arena, &doubleThreshold.weak, &doubleThreshold.strong);
+    try image.write("./image_hysteresis.jpg");
 
     // const n_cores = try std.Thread.getCpuCount();
 
@@ -85,21 +90,6 @@ pub fn main(init: std.process.Init) !void {
     // }
     //
     // for (threads.items) |t| t.join();
-    //
-    // const result = c.stbi_write_jpg(
-    //     output_path,
-    //     width_from_image,
-    //     height_from_image,
-    //     1,
-    //     img.buf.ptr,
-    //     90,
-    // );
-    //
-    // if (result == 0) {
-    //     std.debug.print("Failed to write image\n", .{});
-    // } else {
-    //     std.debug.print("Image written successfully\n", .{});
-    // }
 }
 
 fn processChunk(
@@ -163,6 +153,17 @@ fn Grid(comptime T: type) type {
         width: usize,
         height: usize,
         channels: usize,
+
+        fn fromGrid(arena: std.mem.Allocator, grid: *Self) !Self {
+            const out_buffer = try arena.alloc(T, grid.width * grid.height);
+
+            return .{
+                .buf = out_buffer,
+                .width = grid.width,
+                .height = grid.height,
+                .channels = grid.channels,
+            };
+        }
 
         fn init(arena: std.mem.Allocator, width: usize, height: usize, channels: usize) !Self {
             const out_buffer = try arena.alloc(T, width * height);
@@ -305,14 +306,11 @@ const Image = struct {
         unreachable;
     }
 
-    fn gradientMagnitudeThreshold(self: *Image, arena: std.mem.Allocator) !Image {
-        var result = try self.sobel(arena);
-        var new_img = try Image.fromImg(arena, self);
-
-        for (0..result.image.grid.height) |y| {
-            for (0..result.image.grid.width) |x| {
-                const neighbors = result.image.getNeighborsInDirection(y, x, result.directions.get(y, x));
-                const gradient = result.image.grid.get(y, x);
+    fn gradientMagnitudeThreshold(self: *Image, directions: *Grid(f32)) void {
+        for (0..self.grid.height) |y| {
+            for (0..self.grid.width) |x| {
+                const neighbors = self.getNeighborsInDirection(y, x, directions.get(y, x));
+                const gradient = self.grid.get(y, x);
 
                 var is_largest = true;
 
@@ -325,19 +323,15 @@ const Image = struct {
                 }
 
                 if (is_largest) {
-                    new_img.grid.set(y, x, gradient);
+                    self.grid.set(y, x, gradient);
                 } else {
-                    new_img.grid.set(y, x, 0);
+                    self.grid.set(y, x, 0);
                 }
             }
         }
-
-        return new_img;
     }
 
-    fn doubleThreshold(self: *Image, arena: std.mem.Allocator) !struct { image: Image, weak: PointMap, strong: PointMap } {
-        var new_img = try Image.fromImg(arena, self);
-
+    fn doubleThreshold(self: *Image, arena: std.mem.Allocator) !struct { weak: PointMap, strong: PointMap } {
         const upper = 100;
         const lower = 40;
 
@@ -349,26 +343,23 @@ const Image = struct {
                 const val = self.grid.get(y, x);
                 if (val >= upper) {
                     try strong.put(arena, .{ .x = x, .y = y }, true);
-                    new_img.grid.set(y, x, self.grid.get(y, x));
+                    self.grid.set(y, x, self.grid.get(y, x));
                 } else if (val >= lower) {
                     try weak.put(arena, .{ .x = x, .y = y }, true);
-                    new_img.grid.set(y, x, self.grid.get(y, x));
+                    self.grid.set(y, x, self.grid.get(y, x));
                 } else {
-                    new_img.grid.set(y, x, 0);
+                    self.grid.set(y, x, 0);
                 }
             }
         }
 
         return .{
-            .image = new_img,
             .weak = weak,
             .strong = strong,
         };
     }
 
-    fn hysteresis(self: *Image, arena: std.mem.Allocator, weak: *PointMap, strong: *PointMap) !Image {
-        var new_img = try Image.fromImg(arena, self);
-
+    fn hysteresis(self: *Image, arena: std.mem.Allocator, weak: *PointMap, strong: *PointMap) !void {
         var stack: std.ArrayList(Point) = .empty;
         var visited: PointMap = .empty;
 
@@ -405,15 +396,16 @@ const Image = struct {
             }
         }
 
-        var strong_it = strong.keyIterator();
-        while (strong_it.next()) |p| {
-            new_img.grid.set(p.y, p.x, self.grid.get(p.y, p.x));
+        for (0..self.grid.height) |y| {
+            for (0..self.grid.width) |x| {
+                if (!strong.contains(.{ .x = x, .y = y })) {
+                    self.grid.set(y, x, 0);
+                }
+            }
         }
-
-        return new_img;
     }
 
-    fn sobel(self: *Image, arena: std.mem.Allocator) !struct { image: Image, directions: Grid(f32) } {
+    fn sobel(self: *Image, arena: std.mem.Allocator) !Grid(f32) {
         const kernel_ver: []const []const i8 = SOBEL_VERTICAL;
         const kernel_hor: []const []const i8 = SOBEL_HORIZONTAL;
 
@@ -422,8 +414,8 @@ const Image = struct {
 
         const offset: i64 = @as(i64, @intCast(kernel_height - 1)) >> 1;
 
-        var new_img = try Image.fromImg(arena, self);
-        var directions = try Grid(f32).init(arena, new_img.grid.width, new_img.grid.height, 1);
+        var new_grid = try Grid(u8).fromGrid(arena, &self.grid);
+        var directions = try Grid(f32).init(arena, self.grid.width, self.grid.height, 1);
 
         for (0..self.grid.height) |y| {
             for (0..self.grid.width) |x| {
@@ -450,20 +442,18 @@ const Image = struct {
                 const val = @sqrt(@as(f32, @floatFromInt(sum_ver * sum_ver + sum_hor * sum_hor)));
                 const dir = std.math.atan2(@as(f32, @floatFromInt(sum_ver)), @as(f32, @floatFromInt(sum_hor)));
 
-                new_img.grid.set(y, x, @intFromFloat(val));
+                new_grid.set(y, x, @intFromFloat(val));
                 directions.set(y, x, dir);
             }
         }
 
-        return .{
-            .image = new_img,
-            .directions = directions,
-        };
+        self.grid = new_grid;
+
+        return directions;
     }
 
-    fn gaussian(self: *Image, arena: std.mem.Allocator) !Image {
+    fn gaussian(self: *Image) void {
         const kernel: []const []const i8 = GAUSSIAN;
-        var new_img = try Image.fromImg(arena, self);
         const offset: i64 = @as(i64, @intCast(kernel.len - 1)) >> 1;
 
         for (0..self.grid.height) |y| {
@@ -487,7 +477,7 @@ const Image = struct {
                     }
                 }
 
-                new_img.grid.set(
+                self.grid.set(
                     y,
                     x,
                     @intFromFloat(
@@ -496,8 +486,6 @@ const Image = struct {
                 );
             }
         }
-
-        return new_img;
     }
 
     fn write(self: *Image, path: [*c]const u8) !void {
