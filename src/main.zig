@@ -12,6 +12,18 @@ const GAUSSIAN = &.{
     &.{ 1, 4, 7, 4, 1 },
 };
 
+const SOBEL_VERTICAL = &.{
+    &.{ -1, 0, 1 },
+    &.{ -2, 0, 2 },
+    &.{ -1, 0, 1 },
+};
+
+const SOBEL_HORIZONTAL = &.{
+    &.{ -1, -2, -1 },
+    &.{ 0, 0, 0 },
+    &.{ 1, 2, 1 },
+};
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
@@ -32,10 +44,13 @@ pub fn main(init: std.process.Init) !void {
     var output_image = try Image.fromRgb(arena, &input_image);
     defer output_image.deinit();
 
-    var blurred_image = try output_image.applyKernel(arena, GAUSSIAN);
+    var blurred_image = try output_image.gaussian(arena);
     defer blurred_image.deinit();
 
-    try blurred_image.write(output_path);
+    var sobel_image = try blurred_image.sobel(arena);
+    defer sobel_image.deinit();
+
+    try sobel_image.write(output_path);
 
     // var img = try Image.fromRgb(arena, pixels, width, height, channels);
 
@@ -217,7 +232,49 @@ const Image = struct {
         return img;
     }
 
-    fn applyKernel(self: *Image, arena: std.mem.Allocator, kernel: []const []const i8) !Image {
+    fn sobel(self: *Image, arena: std.mem.Allocator) !Image {
+        const kernel_ver: []const []const i8 = SOBEL_VERTICAL;
+        const kernel_hor: []const []const i8 = SOBEL_HORIZONTAL;
+
+        const kernel_height = kernel_ver.len;
+        const kernel_width = kernel_ver[0].len;
+
+        var new_img = try Image.fromImg(arena, self);
+        const offset: i64 = @as(i64, @intCast(kernel_height - 1)) >> 1;
+
+        for (0..self.height) |y| {
+            for (0..self.width) |x| {
+                var sum_ver: i64 = 0;
+                var sum_hor: i64 = 0;
+
+                for (0..kernel_height) |k_y| {
+                    for (0..kernel_width) |k_x| {
+                        const offset_y: i64 = @as(i64, @intCast(k_y)) - offset;
+                        const offset_x: i64 = @as(i64, @intCast(k_x)) - offset;
+                        const img_y: i64 = @as(i64, @intCast(y)) + offset_y;
+                        const img_x: i64 = @as(i64, @intCast(x)) + offset_x;
+
+                        if (img_y < 0 or img_y >= self.height or img_x < 0 or img_x >= self.width) {
+                            continue;
+                        }
+
+                        const img_val: i16 = @intCast(self.get(@intCast(img_y), @intCast(img_x)));
+                        sum_ver += img_val * @as(i16, @intCast(kernel_ver[k_y][k_x]));
+                        sum_hor += img_val * @as(i16, @intCast(kernel_hor[k_y][k_x]));
+                    }
+                }
+
+                const val = @sqrt(@as(f32, @floatFromInt(sum_ver * sum_ver + sum_hor * sum_hor)));
+
+                new_img.set(y, x, @intFromFloat(val));
+            }
+        }
+
+        return new_img;
+    }
+
+    fn gaussian(self: *Image, arena: std.mem.Allocator) !Image {
+        const kernel: []const []const i8 = GAUSSIAN;
         var new_img = try Image.fromImg(arena, self);
         const offset: i64 = @as(i64, @intCast(kernel.len - 1)) >> 1;
 
@@ -225,6 +282,7 @@ const Image = struct {
             for (0..self.width) |x| {
                 var sum: i64 = 0;
                 var weight_sum: i64 = 0;
+
                 for (kernel, 0..) |row, k_y| {
                     for (row, 0..) |factor, k_x| {
                         const offset_y: i64 = @as(i64, @intCast(k_y)) - offset;
