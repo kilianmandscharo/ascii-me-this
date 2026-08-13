@@ -42,15 +42,12 @@ pub fn main(init: std.process.Init) !void {
     defer input_image.deinit();
 
     var output_image = try Image.fromRgb(arena, &input_image);
-    defer output_image.deinit();
-
     var blurred_image = try output_image.gaussian(arena);
-    defer blurred_image.deinit();
+    var gradient_threshold_image = try blurred_image.gradientMagnitudeThreshold(arena);
+    var result = try gradient_threshold_image.doubleThreshold(arena);
+    var hysteresis_image = try result.image.hysteresis(arena, &result.weak, &result.strong);
 
-    var sobel = try blurred_image.sobel(arena);
-    defer sobel.image.deinit();
-
-    try sobel.image.write(output_path);
+    try hysteresis_image.write(output_path);
 
     // var img = try Image.fromRgb(arena, pixels, width, height, channels);
 
@@ -210,6 +207,9 @@ const Image = struct {
     grid: Grid(u8),
     is_stbi_src: bool = false,
 
+    const Point = struct { x: usize, y: usize };
+    const PointMap = std.AutoHashMapUnmanaged(Point, bool);
+
     const FACTOR_RED: u16 = 77;
     const FACTOR_GREEN: u16 = 150;
     const FACTOR_BLUE: u16 = 29;
@@ -265,6 +265,152 @@ const Image = struct {
         }
 
         return img;
+    }
+
+    fn getNeighborsInDirection(self: *Image, y: usize, x: usize, angleInRad: f32) [2]?u8 {
+        const angleInDeg = std.math.radiansToDegrees(angleInRad);
+        const a = @mod(angleInDeg, 360);
+        const zone: u8 = @intFromFloat(@divFloor(a, 22.5));
+
+        var values: [2]?u8 = .{ null, null };
+
+        const isVertical = zone == 15 or zone == 0 or zone == 7 or zone == 8;
+        if (isVertical) {
+            if (x > 0) values[0] = self.grid.get(y, x - 1);
+            if (x + 1 < self.grid.width) values[1] = self.grid.get(y, x + 1);
+            return values;
+        }
+
+        const isHorizontal = zone == 3 or zone == 4 or zone == 11 or zone == 12;
+        if (isHorizontal) {
+            if (y > 0) values[0] = self.grid.get(y - 1, x);
+            if (y + 1 < self.grid.height) values[1] = self.grid.get(y + 1, x);
+            return values;
+        }
+
+        const isDiagonalUp = zone == 1 or zone == 2 or zone == 9 or zone == 10;
+        if (isDiagonalUp) {
+            if (x > 0 and y + 1 < self.grid.height) values[0] = self.grid.get(y + 1, x - 1);
+            if (x + 1 < self.grid.width and y > 0) values[1] = self.grid.get(y - 1, x + 1);
+            return values;
+        }
+
+        const isDiagonalDown = zone == 5 or zone == 6 or zone == 13 or zone == 14;
+        if (isDiagonalDown) {
+            if (x + 1 < self.grid.width and y + 1 < self.grid.height) values[0] = self.grid.get(y + 1, x + 1);
+            if (x > 0 and y > 0) values[1] = self.grid.get(y - 1, x - 1);
+            return values;
+        }
+
+        unreachable;
+    }
+
+    fn gradientMagnitudeThreshold(self: *Image, arena: std.mem.Allocator) !Image {
+        var result = try self.sobel(arena);
+        var new_img = try Image.fromImg(arena, self);
+
+        for (0..result.image.grid.height) |y| {
+            for (0..result.image.grid.width) |x| {
+                const neighbors = result.image.getNeighborsInDirection(y, x, result.directions.get(y, x));
+                const gradient = result.image.grid.get(y, x);
+
+                var is_largest = true;
+
+                if (neighbors[0] == null or neighbors[1] == null) {
+                    is_largest = false;
+                } else if (neighbors[0] != null and neighbors[0].? > gradient) {
+                    is_largest = false;
+                } else if (neighbors[1].? > gradient) {
+                    is_largest = false;
+                }
+
+                if (is_largest) {
+                    new_img.grid.set(y, x, gradient);
+                } else {
+                    new_img.grid.set(y, x, 0);
+                }
+            }
+        }
+
+        return new_img;
+    }
+
+    fn doubleThreshold(self: *Image, arena: std.mem.Allocator) !struct { image: Image, weak: PointMap, strong: PointMap } {
+        var new_img = try Image.fromImg(arena, self);
+
+        const upper = 100;
+        const lower = 40;
+
+        var weak: std.AutoHashMapUnmanaged(Point, bool) = .empty;
+        var strong: std.AutoHashMapUnmanaged(Point, bool) = .empty;
+
+        for (0..self.grid.height) |y| {
+            for (0..self.grid.width) |x| {
+                const val = self.grid.get(y, x);
+                if (val >= upper) {
+                    try strong.put(arena, .{ .x = x, .y = y }, true);
+                    new_img.grid.set(y, x, self.grid.get(y, x));
+                } else if (val >= lower) {
+                    try weak.put(arena, .{ .x = x, .y = y }, true);
+                    new_img.grid.set(y, x, self.grid.get(y, x));
+                } else {
+                    new_img.grid.set(y, x, 0);
+                }
+            }
+        }
+
+        return .{
+            .image = new_img,
+            .weak = weak,
+            .strong = strong,
+        };
+    }
+
+    fn hysteresis(self: *Image, arena: std.mem.Allocator, weak: *PointMap, strong: *PointMap) !Image {
+        var new_img = try Image.fromImg(arena, self);
+
+        var stack: std.ArrayList(Point) = .empty;
+        var visited: PointMap = .empty;
+
+        var it = strong.keyIterator();
+        while (it.next()) |p| {
+            try stack.append(arena, p.*);
+        }
+
+        while (stack.pop()) |p| {
+            for (0..3) |y| {
+                for (0..3) |x| {
+                    const y_offset = @as(i64, @intCast(y)) - 1;
+                    const x_offset = @as(i64, @intCast(x)) - 1;
+
+                    if ((y_offset == 0 and x_offset == 0) or
+                        (x_offset < 0 and p.x == 0 or x_offset > 0 and @as(i64, @intCast(p.x)) + x_offset >= self.grid.width) or
+                        (y_offset < 0 and p.y == 0 or y_offset > 0 and @as(i64, @intCast(p.y)) + y_offset >= self.grid.height))
+                    {
+                        continue;
+                    }
+
+                    const new_x = @as(i64, @intCast(p.x)) + x_offset;
+                    const new_y = @as(i64, @intCast(p.y)) + y_offset;
+                    const neighbor: Point = .{ .x = @as(usize, @intCast(new_x)), .y = @as(usize, @intCast(new_y)) };
+
+                    if (visited.contains(neighbor)) continue;
+                    try visited.put(arena, neighbor, true);
+
+                    if (weak.contains(neighbor)) {
+                        try stack.append(arena, neighbor);
+                        try strong.put(arena, neighbor, true);
+                    }
+                }
+            }
+        }
+
+        var strong_it = strong.keyIterator();
+        while (strong_it.next()) |p| {
+            new_img.grid.set(p.y, p.x, self.grid.get(p.y, p.x));
+        }
+
+        return new_img;
     }
 
     fn sobel(self: *Image, arena: std.mem.Allocator) !struct { image: Image, directions: Grid(f32) } {
