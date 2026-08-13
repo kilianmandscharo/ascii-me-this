@@ -47,10 +47,10 @@ pub fn main(init: std.process.Init) !void {
     var blurred_image = try output_image.gaussian(arena);
     defer blurred_image.deinit();
 
-    var sobel_image = try blurred_image.sobel(arena);
-    defer sobel_image.deinit();
+    var sobel = try blurred_image.sobel(arena);
+    defer sobel.image.deinit();
 
-    try sobel_image.write(output_path);
+    try sobel.image.write(output_path);
 
     // var img = try Image.fromRgb(arena, pixels, width, height, channels);
 
@@ -158,11 +158,56 @@ fn processChunk(
     }
 }
 
+fn Grid(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        buf: []T,
+        width: usize,
+        height: usize,
+        channels: usize,
+
+        fn init(arena: std.mem.Allocator, width: usize, height: usize, channels: usize) !Self {
+            const out_buffer = try arena.alloc(T, width * height);
+
+            return .{
+                .buf = out_buffer,
+                .width = width,
+                .height = height,
+                .channels = channels,
+            };
+        }
+
+        fn initWithData(data: []T, width: usize, height: usize, channels: usize) Self {
+            return .{
+                .buf = data,
+                .width = width,
+                .height = height,
+                .channels = channels,
+            };
+        }
+
+        inline fn getIndex(self: *Self, y: usize, x: usize) usize {
+            return (y * self.width + x) * self.channels;
+        }
+
+        pub inline fn get(self: *Self, y: usize, x: usize) T {
+            return self.buf[self.getIndex(y, x)];
+        }
+
+        pub inline fn getWithOffset(self: *Self, y: usize, x: usize, offset: usize) T {
+            return self.buf[self.getIndex(y, x) + offset];
+        }
+
+        pub inline fn set(self: *Self, y: usize, x: usize, val: T) void {
+            const index = self.getIndex(y, x);
+            self.buf[index] = val;
+        }
+    };
+}
+
 const Image = struct {
-    buf: []u8,
-    width: usize,
-    height: usize,
-    channels: usize,
+    grid: Grid(u8),
     is_stbi_src: bool = false,
 
     const FACTOR_RED: u16 = 77;
@@ -171,19 +216,13 @@ const Image = struct {
 
     fn deinit(self: *Image) void {
         if (self.is_stbi_src) {
-            c.stbi_image_free(self.buf.ptr);
+            c.stbi_image_free(self.grid.buf.ptr);
         }
     }
 
     fn fromImg(arena: std.mem.Allocator, src: *Image) !Image {
-        const out_buffer = try arena.alloc(u8, src.width * src.height);
-        for (out_buffer) |*p| p.* = 0;
-
         return .{
-            .buf = out_buffer,
-            .width = src.width,
-            .height = src.height,
-            .channels = src.channels,
+            .grid = try Grid(u8).init(arena, src.grid.width, src.grid.height, src.grid.channels),
         };
     }
 
@@ -200,50 +239,48 @@ const Image = struct {
         }
 
         return .{
-            .buf = pixels[0..@intCast(width * height * channels)],
-            .width = @intCast(width),
-            .height = @intCast(height),
-            .channels = @intCast(channels),
+            .grid = Grid(u8).initWithData(
+                pixels[0..@intCast(width * height * channels)],
+                @intCast(width),
+                @intCast(height),
+                @intCast(channels),
+            ),
             .is_stbi_src = true,
         };
     }
 
     fn fromRgb(arena: std.mem.Allocator, src: *Image) !Image {
-        const out_buffer = try arena.alloc(u8, src.width * src.height);
-        for (out_buffer) |*p| p.* = 0;
-
         var img: Image = .{
-            .buf = out_buffer,
-            .width = src.width,
-            .height = src.height,
-            .channels = 1,
+            .grid = try Grid(u8).init(arena, src.grid.width, src.grid.height, 1),
         };
 
-        for (0..src.height) |y| {
-            for (0..src.width) |x| {
-                const r = @as(u16, src.getWithOffset(y, x, 0));
-                const g = @as(u16, src.getWithOffset(y, x, 1));
-                const b = @as(u16, src.getWithOffset(y, x, 2));
+        for (0..src.grid.height) |y| {
+            for (0..src.grid.width) |x| {
+                const r = @as(u16, src.grid.getWithOffset(y, x, 0));
+                const g = @as(u16, src.grid.getWithOffset(y, x, 1));
+                const b = @as(u16, src.grid.getWithOffset(y, x, 2));
                 const val: u8 = @intCast((FACTOR_RED * r + FACTOR_GREEN * g + FACTOR_BLUE * b) >> 8);
-                img.set(y, x, val);
+                img.grid.set(y, x, val);
             }
         }
 
         return img;
     }
 
-    fn sobel(self: *Image, arena: std.mem.Allocator) !Image {
+    fn sobel(self: *Image, arena: std.mem.Allocator) !struct { image: Image, directions: Grid(f32) } {
         const kernel_ver: []const []const i8 = SOBEL_VERTICAL;
         const kernel_hor: []const []const i8 = SOBEL_HORIZONTAL;
 
         const kernel_height = kernel_ver.len;
         const kernel_width = kernel_ver[0].len;
 
-        var new_img = try Image.fromImg(arena, self);
         const offset: i64 = @as(i64, @intCast(kernel_height - 1)) >> 1;
 
-        for (0..self.height) |y| {
-            for (0..self.width) |x| {
+        var new_img = try Image.fromImg(arena, self);
+        var directions = try Grid(f32).init(arena, new_img.grid.width, new_img.grid.height, 1);
+
+        for (0..self.grid.height) |y| {
+            for (0..self.grid.width) |x| {
                 var sum_ver: i64 = 0;
                 var sum_hor: i64 = 0;
 
@@ -254,23 +291,28 @@ const Image = struct {
                         const img_y: i64 = @as(i64, @intCast(y)) + offset_y;
                         const img_x: i64 = @as(i64, @intCast(x)) + offset_x;
 
-                        if (img_y < 0 or img_y >= self.height or img_x < 0 or img_x >= self.width) {
+                        if (img_y < 0 or img_y >= self.grid.height or img_x < 0 or img_x >= self.grid.width) {
                             continue;
                         }
 
-                        const img_val: i16 = @intCast(self.get(@intCast(img_y), @intCast(img_x)));
+                        const img_val: i16 = @intCast(self.grid.get(@intCast(img_y), @intCast(img_x)));
                         sum_ver += img_val * @as(i16, @intCast(kernel_ver[k_y][k_x]));
                         sum_hor += img_val * @as(i16, @intCast(kernel_hor[k_y][k_x]));
                     }
                 }
 
                 const val = @sqrt(@as(f32, @floatFromInt(sum_ver * sum_ver + sum_hor * sum_hor)));
+                const dir = std.math.atan2(@as(f32, @floatFromInt(sum_ver)), @as(f32, @floatFromInt(sum_hor)));
 
-                new_img.set(y, x, @intFromFloat(val));
+                new_img.grid.set(y, x, @intFromFloat(val));
+                directions.set(y, x, dir);
             }
         }
 
-        return new_img;
+        return .{
+            .image = new_img,
+            .directions = directions,
+        };
     }
 
     fn gaussian(self: *Image, arena: std.mem.Allocator) !Image {
@@ -278,8 +320,8 @@ const Image = struct {
         var new_img = try Image.fromImg(arena, self);
         const offset: i64 = @as(i64, @intCast(kernel.len - 1)) >> 1;
 
-        for (0..self.height) |y| {
-            for (0..self.width) |x| {
+        for (0..self.grid.height) |y| {
+            for (0..self.grid.width) |x| {
                 var sum: i64 = 0;
                 var weight_sum: i64 = 0;
 
@@ -290,16 +332,16 @@ const Image = struct {
                         const img_y: i64 = @as(i64, @intCast(y)) + offset_y;
                         const img_x: i64 = @as(i64, @intCast(x)) + offset_x;
 
-                        if (img_y < 0 or img_y >= self.height or img_x < 0 or img_x >= self.width) {
+                        if (img_y < 0 or img_y >= self.grid.height or img_x < 0 or img_x >= self.grid.width) {
                             continue;
                         }
 
                         weight_sum += factor;
-                        sum += @as(i16, @intCast(self.get(@intCast(img_y), @intCast(img_x)))) * @as(i16, @intCast(factor));
+                        sum += @as(i16, @intCast(self.grid.get(@intCast(img_y), @intCast(img_x)))) * @as(i16, @intCast(factor));
                     }
                 }
 
-                new_img.set(
+                new_img.grid.set(
                     y,
                     x,
                     @intFromFloat(
@@ -312,30 +354,13 @@ const Image = struct {
         return new_img;
     }
 
-    inline fn getIndex(self: *Image, y: usize, x: usize) usize {
-        return (y * self.width + x) * self.channels;
-    }
-
-    inline fn get(self: *Image, y: usize, x: usize) u8 {
-        return self.buf[self.getIndex(y, x)];
-    }
-
-    inline fn getWithOffset(self: *Image, y: usize, x: usize, offset: usize) u8 {
-        return self.buf[self.getIndex(y, x) + offset];
-    }
-
-    inline fn set(self: *Image, y: usize, x: usize, val: u8) void {
-        const index = self.getIndex(y, x);
-        self.buf[index] = val;
-    }
-
     fn write(self: *Image, path: [*c]const u8) !void {
         const result = c.stbi_write_jpg(
             path,
-            @intCast(self.width),
-            @intCast(self.height),
-            @intCast(self.channels),
-            self.buf.ptr,
+            @intCast(self.grid.width),
+            @intCast(self.grid.height),
+            @intCast(self.grid.channels),
+            self.grid.buf.ptr,
             90,
         );
 
