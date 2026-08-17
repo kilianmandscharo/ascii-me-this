@@ -3,6 +3,8 @@ const c = @import("c");
 
 const chunk_size = 10;
 const characters = [_]u8{ '.', ':', 'c', 'o', 'P', 'O', '@', '$' };
+const additional_chars = [_]u8{ '|', '_', '/', '\\' };
+const all_chars = characters ++ additional_chars;
 
 const GAUSSIAN = &.{
     &.{ 1, 4, 7, 4, 1 },
@@ -26,6 +28,7 @@ const SOBEL_HORIZONTAL = &.{
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
+    const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
     std.debug.print("{s}\n", .{args[0]});
@@ -43,20 +46,60 @@ pub fn main(init: std.process.Init) !void {
     var image = try Image.fromRgb(arena, &input_image);
     try image.write("./image_grayscale.jpg");
 
-    image.gaussian();
-    try image.write("./image_blurred.jpg");
+    var scaled_image = try image.scaleDown(arena, chunk_size);
+    try scaled_image.write("./image_scaled.jpg");
 
-    var directions = try image.sobel(arena);
-    try image.write("./image_sobel.jpg");
+    var scaled_image_copy = try scaled_image.clone(arena);
 
-    image.gradientMagnitudeThreshold(&directions);
-    try image.write("./image_gradient_threshold.jpg");
+    scaled_image.gaussian();
+    try scaled_image.write("./image_blurred.jpg");
 
-    var doubleThreshold = try image.doubleThreshold(arena);
-    try image.write("./image_double_threshold.jpg");
+    var directions = try scaled_image.sobel(arena);
+    try scaled_image.write("./image_sobel.jpg");
 
-    try image.hysteresis(arena, &doubleThreshold.weak, &doubleThreshold.strong);
-    try image.write("./image_hysteresis.jpg");
+    scaled_image.gradientMagnitudeThreshold(&directions);
+    try scaled_image.write("./image_gradient_threshold.jpg");
+
+    var doubleThreshold = try scaled_image.doubleThreshold(arena);
+    try scaled_image.write("./image_double_threshold.jpg");
+
+    try scaled_image.hysteresis(arena, &doubleThreshold.weak, &doubleThreshold.strong);
+    try scaled_image.write("./image_hysteresis.jpg");
+
+    const glyph_map = try createGlyphMap(io, arena);
+
+    image.clear();
+
+    for (0..scaled_image.grid.height) |y| {
+        for (0..scaled_image.grid.width) |x| {
+            const y_with_offset = y * chunk_size;
+            const x_with_offset = x * chunk_size;
+
+            var char: u8 = 0;
+
+            if (scaled_image.grid.get(y, x) == 0) {
+                const char_index: usize = (@as(u16, scaled_image_copy.grid.get(y, x)) * @as(u16, characters.len)) >> 8;
+                char = characters[char_index];
+            } else {
+                char = additional_chars[@intFromEnum(directions.get(y, x))];
+            }
+
+            const glyph = glyph_map.get(char) orelse unreachable;
+
+            for (0..glyph.height) |glyph_y| {
+                for (0..glyph.width) |glyph_x| {
+                    const src_offset = glyph_y * glyph.width + glyph_x;
+                    const dst_x = glyph_x + x_with_offset;
+                    const dst_y = glyph_y + y_with_offset;
+                    if (dst_x < image.grid.width and dst_y < image.grid.height) {
+                        image.grid.set(dst_y, dst_x, glyph.data[src_offset]);
+                    }
+                }
+            }
+        }
+    }
+
+    try image.write("./image_final.jpg");
 
     // const n_cores = try std.Thread.getCpuCount();
 
@@ -211,6 +254,13 @@ const Image = struct {
     const Point = struct { x: usize, y: usize };
     const PointMap = std.AutoHashMapUnmanaged(Point, bool);
 
+    const Direction = enum {
+        Vertical,
+        Horizontal,
+        DownUp,
+        UpDown,
+    };
+
     const FACTOR_RED: u16 = 77;
     const FACTOR_GREEN: u16 = 150;
     const FACTOR_BLUE: u16 = 29;
@@ -219,6 +269,12 @@ const Image = struct {
         if (self.is_stbi_src) {
             c.stbi_image_free(self.grid.buf.ptr);
         }
+    }
+
+    fn init(arena: std.mem.Allocator, width: usize, height: usize) !Image {
+        return .{
+            .grid = try Grid(u8).init(arena, width, height, 1),
+        };
     }
 
     fn fromImg(arena: std.mem.Allocator, src: *Image) !Image {
@@ -268,45 +324,108 @@ const Image = struct {
         return img;
     }
 
-    fn getNeighborsInDirection(self: *Image, y: usize, x: usize, angleInRad: f32) [2]?u8 {
+    pub fn clear(self: *Image) void {
+        for (self.grid.buf) |*p| {
+            p.* = 0;
+        }
+    }
+
+    pub fn clone(self: *Image, arena: std.mem.Allocator) !Image {
+        const buf = try arena.dupe(u8, self.grid.buf);
+        return .{
+            .grid = Grid(u8).initWithData(buf, self.grid.width, self.grid.height, self.grid.channels),
+        };
+    }
+
+    fn scaleDown(self: *Image, arena: std.mem.Allocator, factor: usize) !Image {
+        const new_width: usize = try std.math.divCeil(usize, self.grid.width, factor);
+        const new_height: usize = try std.math.divCeil(usize, self.grid.height, factor);
+
+        var new_img = try Image.init(arena, new_width, new_height);
+
+        for (0..new_height) |y| {
+            for (0..new_width) |x| {
+                var total: u16 = 0;
+                var count: u8 = 0;
+
+                for (0..factor) |i| {
+                    for (0..factor) |j| {
+                        const y_with_offset = y * factor + i;
+                        const x_with_offset = x * factor + j;
+
+                        if (y >= new_height or x >= new_width) {
+                            continue;
+                        }
+
+                        const val = self.grid.get(y_with_offset, x_with_offset);
+                        total += val;
+                        count += 1;
+                    }
+                }
+
+                new_img.grid.set(y, x, @intCast(@divTrunc(total, count)));
+            }
+        }
+
+        return new_img;
+    }
+
+    fn getDirectionFromAngle(angleInRad: f32) Direction {
         const angleInDeg = std.math.radiansToDegrees(angleInRad);
         const a = @mod(angleInDeg, 360);
         const zone: u8 = @intFromFloat(@divFloor(a, 22.5));
 
-        var values: [2]?u8 = .{ null, null };
-
         const isVertical = zone == 15 or zone == 0 or zone == 7 or zone == 8;
         if (isVertical) {
-            if (x > 0) values[0] = self.grid.get(y, x - 1);
-            if (x + 1 < self.grid.width) values[1] = self.grid.get(y, x + 1);
-            return values;
+            return .Vertical;
         }
 
         const isHorizontal = zone == 3 or zone == 4 or zone == 11 or zone == 12;
         if (isHorizontal) {
-            if (y > 0) values[0] = self.grid.get(y - 1, x);
-            if (y + 1 < self.grid.height) values[1] = self.grid.get(y + 1, x);
-            return values;
+            return .Horizontal;
         }
 
         const isDiagonalUp = zone == 1 or zone == 2 or zone == 9 or zone == 10;
         if (isDiagonalUp) {
-            if (x > 0 and y + 1 < self.grid.height) values[0] = self.grid.get(y + 1, x - 1);
-            if (x + 1 < self.grid.width and y > 0) values[1] = self.grid.get(y - 1, x + 1);
-            return values;
+            return .DownUp;
         }
 
         const isDiagonalDown = zone == 5 or zone == 6 or zone == 13 or zone == 14;
         if (isDiagonalDown) {
-            if (x + 1 < self.grid.width and y + 1 < self.grid.height) values[0] = self.grid.get(y + 1, x + 1);
-            if (x > 0 and y > 0) values[1] = self.grid.get(y - 1, x - 1);
-            return values;
+            return .UpDown;
         }
 
         unreachable;
     }
 
-    fn gradientMagnitudeThreshold(self: *Image, directions: *Grid(f32)) void {
+    fn getNeighborsInDirection(self: *Image, y: usize, x: usize, direction: Direction) [2]?u8 {
+        var values: [2]?u8 = .{ null, null };
+
+        switch (direction) {
+            .Vertical => {
+                if (x > 0) values[0] = self.grid.get(y, x - 1);
+                if (x + 1 < self.grid.width) values[1] = self.grid.get(y, x + 1);
+                return values;
+            },
+            .Horizontal => {
+                if (y > 0) values[0] = self.grid.get(y - 1, x);
+                if (y + 1 < self.grid.height) values[1] = self.grid.get(y + 1, x);
+                return values;
+            },
+            .DownUp => {
+                if (x > 0 and y + 1 < self.grid.height) values[0] = self.grid.get(y + 1, x - 1);
+                if (x + 1 < self.grid.width and y > 0) values[1] = self.grid.get(y - 1, x + 1);
+                return values;
+            },
+            .UpDown => {
+                if (x + 1 < self.grid.width and y + 1 < self.grid.height) values[0] = self.grid.get(y + 1, x + 1);
+                if (x > 0 and y > 0) values[1] = self.grid.get(y - 1, x - 1);
+                return values;
+            },
+        }
+    }
+
+    fn gradientMagnitudeThreshold(self: *Image, directions: *Grid(Direction)) void {
         for (0..self.grid.height) |y| {
             for (0..self.grid.width) |x| {
                 const neighbors = self.getNeighborsInDirection(y, x, directions.get(y, x));
@@ -405,7 +524,7 @@ const Image = struct {
         }
     }
 
-    fn sobel(self: *Image, arena: std.mem.Allocator) !Grid(f32) {
+    fn sobel(self: *Image, arena: std.mem.Allocator) !Grid(Direction) {
         const kernel_ver: []const []const i8 = SOBEL_VERTICAL;
         const kernel_hor: []const []const i8 = SOBEL_HORIZONTAL;
 
@@ -415,7 +534,7 @@ const Image = struct {
         const offset: i64 = @as(i64, @intCast(kernel_height - 1)) >> 1;
 
         var new_grid = try Grid(u8).fromGrid(arena, &self.grid);
-        var directions = try Grid(f32).init(arena, self.grid.width, self.grid.height, 1);
+        var directions = try Grid(Direction).init(arena, self.grid.width, self.grid.height, 1);
 
         for (0..self.grid.height) |y| {
             for (0..self.grid.width) |x| {
@@ -443,7 +562,7 @@ const Image = struct {
                 const dir = std.math.atan2(@as(f32, @floatFromInt(sum_ver)), @as(f32, @floatFromInt(sum_hor)));
 
                 new_grid.set(y, x, @intFromFloat(val));
-                directions.set(y, x, dir);
+                directions.set(y, x, getDirectionFromAngle(dir));
             }
         }
 
@@ -525,7 +644,7 @@ fn createGlyphMap(io: std.Io, arena: std.mem.Allocator) !GlyphMap {
 
     var map: GlyphMap = .{};
 
-    for (characters) |char| {
+    for (all_chars) |char| {
         var x0: c_int = 0;
         var y0: c_int = 0;
         var x1: c_int = chunk_size;
