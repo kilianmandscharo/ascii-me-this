@@ -70,6 +70,16 @@ pub fn main(init: std.process.Init) !void {
 
     image.clear();
 
+    var out_file = try std.Io.Dir.cwd().createFile(io, "./out.data", .{});
+    var buf: [1024]u8 = undefined;
+    var file_writer = out_file.writer(io, &buf);
+    const writer = &file_writer.interface;
+
+    try writer.print("{d},{d}\n", .{ scaled_image.grid.width, scaled_image.grid.height });
+
+    var current_char: u8 = 0;
+    var count: usize = 0;
+
     for (0..scaled_image.grid.height) |y| {
         for (0..scaled_image.grid.width) |x| {
             const y_with_offset = y * chunk_size;
@@ -82,6 +92,16 @@ pub fn main(init: std.process.Init) !void {
                 char = characters[char_index];
             } else {
                 char = additional_chars[@intFromEnum(directions.get(y, x))];
+            }
+
+            if (char != current_char) {
+                if (count > 0) {
+                    try writer.print("{d}{c}", .{ count, current_char });
+                }
+                current_char = char;
+                count = 1;
+            } else {
+                count += 1;
             }
 
             const glyph = glyph_map.get(char) orelse unreachable;
@@ -98,6 +118,8 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+
+    try writer.flush();
 
     try image.write("./image_final.jpg");
 
