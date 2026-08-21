@@ -119,6 +119,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    try writer.print("{d}{c}", .{ count, current_char });
     try writer.flush();
 
     try image.write("./image_final.jpg");
